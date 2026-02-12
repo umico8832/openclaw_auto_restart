@@ -15,17 +15,32 @@ set +m              # 关闭作业控制，避免脚本中断时进入交互式 
 
 # === 精准猎杀函数 ===
 kill_port_holder() {
-    local PIDS          
+    local PIDS
     PIDS=$(lsof -nP -t -iTCP:$TARGET_PORT -sTCP:LISTEN 2>/dev/null)
 
     if [ -n "$PIDS" ]; then
-        kill -9 $PIDS 2>/dev/null
-        sleep 0.5
+        kill -15 $PIDS 2>/dev/null
+        sleep 0.3
+        for pid in $PIDS; do
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        done
+        sleep 0.2
     fi
 
-    # 万一程序没占端口但在后台卡死了
-    pkill -9 -f "openclaw gateway" 2>/dev/null
+    # 兜底：只从“进程名=openclaw”里挑出参数包含 gateway 的来杀（避免 pkill -f 宽匹配）
+    local pid cmd
+    for pid in $(pgrep -x openclaw 2>/dev/null); do
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null)
+        if [[ "$cmd" == *" gateway "* ]] || [[ "$cmd" == *" gateway" ]]; then
+            kill -15 "$pid" 2>/dev/null
+            sleep 0.2
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        fi
+    done
 }
+
+
+
 
 
 
