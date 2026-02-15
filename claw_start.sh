@@ -99,6 +99,7 @@ while true; do
     # === 启动区 ===
     echo "✅ [$(date +%T)] 网络正常，准备启动服务！"
     kill_port_holder
+    sleep 2 # 确保端口完全释放了，避免启动时被占用导致的假死。
     echo "🚀 [$(date +%T)] 正在启动 Gateway...(Port: $TARGET_PORT)"     
     START_TIME=$(date +%s)                              # 记录启动时间戳，用于后续监控运行时长和冷却逻辑。
     echo "--- New Session $(date) ---" >> "$LOG_FILE"   # 每次启动都在日志里标记一个分割线，方便后续分析和排查历史记录。
