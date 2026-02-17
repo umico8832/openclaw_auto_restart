@@ -11,7 +11,7 @@ ERROR_KEYWORDS="channel exited|ECONNRESET|WebSocket Error|408 Request Time-out|E
 
 touch "$LOG_FILE"   # 确保日志文件存在，避免后续写入时出错。
 set +m              # 关闭作业控制，避免脚本中断时进入交互式 shell 导致无法自动重启。
-
+PROXY_WARNED=0      # 代理警告标志，避免重复输出同一警告信息。
 
 
 # === 精准猎杀函数 ===
@@ -69,6 +69,7 @@ check_network() {
     if [ "$cn_code" != "204" ]; then
         local baidu_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 --max-time 3 "https://www.baidu.com")
         if [ "$baidu_code" != "200" ]; then
+            PROXY_WARNED=0 
             return 1 # 物理断网
         fi
     fi
@@ -81,11 +82,49 @@ check_network() {
     
     # 8.8.8.8 作为一个接口，通常返回 200 或 404 (如果路径不对)，但只要不是 000 (连接失败)，就说明通了
     if [ "$google_check" != "000" ]; then
+        PROXY_WARNED=0
         return 0 # 成功翻墙
     else
+        if [ "$PROXY_WARNED" -eq 0 ]; then
         echo "⚠️  国内网络正常，但无法连接 Google IP (代理未生效)"
-        return 1
+        PROXY_WARNED=1
     fi
+    return 1
+    fi
+}
+
+
+
+# === 日志报错 + 网络也不通 时的防抖复核 ===
+# 返回值：
+#   0 = 网络恢复（调用处应该 continue 继续运行）
+#   1 = 判定持续断网（调用处应该 break 重启/等待）
+handle_error_net_flap() {
+    local pipe_pid="$1"
+
+    echo "⚠️ [$(date +%T)] 日志报错且检测到断网，正在复核..."
+
+    # 第一次复核 (等待 3 秒)
+    sleep 3
+    if check_network; then
+        echo "✅ [$(date +%T)] 网络已经恢复，忽略此次报错..."
+        return 0
+    fi
+
+    echo "⚠️ [$(date +%T)] 复核失败，最后尝试..."
+
+    # 第二次复核 (再等 3 秒)
+    sleep 3
+    if check_network; then
+        echo "✅ [$(date +%T)] 网络已自动恢复，服务继续运行..."
+        return 0
+    fi
+
+    # 连续三次检测都挂了，判定为持续断网
+    echo "📉 [$(date +%T)] 判定为持续断网 -> 停止服务等待恢复..."
+    kill_port_holder
+    kill -9 "$pipe_pid" 2>/dev/null
+    return 1
 }
 
 
@@ -105,7 +144,7 @@ while true; do
     # === 启动区 ===
     echo "✅ [$(date +%T)] 网络正常，准备启动服务！"
     kill_port_holder
-    sleep 2 # 确保端口完全释放了，避免启动时被占用导致的假死。
+    sleep 5 # 确保端口完全释放了，避免启动时被占用导致的假死。
     echo "🚀 [$(date +%T)] 正在启动 Gateway...(Port: $TARGET_PORT)"     
     START_TIME=$(date +%s)                              # 记录启动时间戳，用于后续监控运行时长和冷却逻辑。
     echo "--- New Session $(date) ---" >> "$LOG_FILE"   # 每次启动都在日志里标记一个分割线，方便后续分析和排查历史记录。
@@ -140,9 +179,16 @@ while true; do
             
             # [检查 2] 运行时掉线检测
             if ! check_network; then
-                echo "📉 [$(date +%T)] 运行时检测到网络中断 -> 服务停止..."
-                kill_port_holder
-                break
+                echo "📉 [$(date +%T)] 运行时检测到网络异常，3秒后复核..."
+                sleep 3
+                if ! check_network; then
+                    echo "📉 [$(date +%T)] 复核失败 -> 服务停止等待恢复..."
+                    kill_port_holder
+                    kill -9 "$PIPE_PID" 2>/dev/null
+                    break
+                else
+                    echo "✅ [$(date +%T)] 网络已恢复，继续运行"
+                fi
             fi
 
             # [检查 3] 日志容量防爆检测 
@@ -151,7 +197,8 @@ while true; do
             LOG_SIZE=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
             if [ "$LOG_SIZE" -gt 10485760 ]; then
                 echo "🧹 [$(date +%T)] 日志文件过大(${LOG_SIZE} bytes)，执行维护性重启..."
-                kill_port_holder # 杀掉进程释放文件句柄
+                kill_port_holder 
+                kill -9 "$PIPE_PID" 2>/dev/null
                 # break 跳出循环后，会自动执行大循环末尾的日志轮转代码
                 break 
             fi
@@ -185,22 +232,26 @@ while true; do
         #    - 释放占用端口的进程
         #    - 强制终止当前管道/子进程（PIPE_PID）
         #    - 跳出循环，交由外层逻辑完成重启
+
+        # 看门狗核心：检测到错误日志时的处理逻辑
         if echo "$NEW_LOG_CONTENT" | grep -E -q "$ERROR_KEYWORDS"; then
             
-            if ! check_network; then
-                # 情况 A：日志报错了，而且网络检测也挂了 -> 判定为网络中断
-                echo -e "\n📉 [$(date +%T)] 运行时检测到网络中断，服务暂停"
+            # 情况 A：日志报错，先测一下网络
+            if check_network; then
+                # 网络是通的，但日志报错了 -> 说明是程序内部崩溃/被服务端踢出
+                echo -e "\n⚡️ [看门狗] 检测到致命错误 (网络正常) -> 正在执行重启..."
+                kill_port_holder
+                kill -9 $PIPE_PID 2>/dev/null
+                break
             else
-                # 情况 B：日志报错了，但网络居然是通的 -> 判定为程序崩溃/被服务端踢出
-                echo -e "\n⚡️ [看门狗] 检测到致命错误 (网络正常) -> 执行强制重启!"
+                # 情况 B：日志报错，且网络也不通 -> 可能是临时波动
+                if handle_error_net_flap "$PIPE_PID"; then
+                    continue
+                else
+                    break
+                fi    
             fi
-
-            # 无论哪种情况，都要杀进程并跳出循环
-            kill_port_holder
-            kill -9 $PIPE_PID 2>/dev/null
-            break
         fi
-
 
     done
 
@@ -208,7 +259,7 @@ while true; do
     [[ $(wc -l < "$LOG_FILE") -gt 5000 ]] && tail -n 1000 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE" && LAST_LINE_COUNT=$(wc -l < "$LOG_FILE" | tr -d ' ')
     
     RUN_DURATION=$(($(date +%s) - START_TIME))
-    [[ $RUN_DURATION -lt 10 ]] && sleep 3 || sleep 1
+    [[ $RUN_DURATION -lt 15 ]] && sleep 5 || sleep 1
 
 
 done
