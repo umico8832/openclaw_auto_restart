@@ -176,22 +176,8 @@ while true; do
                 kill -9 $PIPE_PID 2>/dev/null
                 break
             fi
-            
-            # [检查 2] 运行时掉线检测
-            if ! check_network; then
-                echo "📉 [$(date +%T)] 运行时检测到网络异常，3秒后复核..."
-                sleep 3
-                if ! check_network; then
-                    echo "📉 [$(date +%T)] 复核失败 -> 服务停止等待恢复..."
-                    kill_port_holder
-                    kill -9 "$PIPE_PID" 2>/dev/null
-                    break
-                else
-                    echo "✅ [$(date +%T)] 网络已恢复，继续运行"
-                fi
-            fi
 
-            # [检查 3] 日志容量防爆检测 
+            # [检查 2] 日志容量防爆检测 
             # macOS 使用 stat -f%z 获取文件大小(字节)，Linux 使用 stat -c%s
             # 设置阈值为 10MB (10485760 字节)
             LOG_SIZE=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
