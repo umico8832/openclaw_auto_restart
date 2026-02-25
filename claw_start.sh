@@ -95,37 +95,6 @@ check_network() {
 
 
 
-# === 日志报错 + 网络也不通 时的防抖复核 ===
-# 返回值：
-#   0 = 网络恢复（调用处应该 continue 继续运行）
-#   1 = 判定持续断网（调用处应该 break 重启/等待）
-handle_error_net_flap() {
-    local pipe_pid="$1"
-
-    echo "⚠️ [$(date +%T)] 日志报错且检测到断网，正在复核..."
-
-    # 第一次复核 (等待 3 秒)
-    sleep 3
-    if check_network; then
-        echo "✅ [$(date +%T)] 网络已经恢复，忽略此次报错..."
-        return 0
-    fi
-
-    echo "⚠️ [$(date +%T)] 复核失败，最后尝试..."
-
-    # 第二次复核 (再等 3 秒)
-    sleep 3
-    if check_network; then
-        echo "✅ [$(date +%T)] 网络已自动恢复，服务继续运行..."
-        return 0
-    fi
-
-    # 连续三次检测都挂了，判定为持续断网
-    echo "📉 [$(date +%T)] 判定为持续断网 -> 停止服务等待恢复..."
-    kill_port_holder
-    kill -9 "$pipe_pid" 2>/dev/null
-    return 1
-}
 
 
 
@@ -223,24 +192,12 @@ while true; do
         
         FILTERED_CONTENT=$(echo "$NEW_LOG_CONTENT" | grep -v -i "retry")
 
-        # 然后只在剩下的内容里找错误
         if echo "$FILTERED_CONTENT" | grep -E -q "$ERROR_KEYWORDS"; then
             
-            # 情况 A：日志报错，先测一下网络
-            if check_network; then
-                # 网络是通的，但日志报错了 -> 说明是程序内部崩溃/被服务端踢出
-                echo -e "\n⚡️ [看门狗] 检测到致命错误 (网络正常) -> 正在执行重启..."
-                kill_port_holder
-                kill -9 $PIPE_PID 2>/dev/null
-                break
-            else
-                # 情况 B：日志报错，且网络也不通 -> 可能是临时波动
-                if handle_error_net_flap "$PIPE_PID"; then
-                    continue
-                else
-                    break
-                fi    
-            fi
+            echo -e "\n⚡️ [看门狗] 捕获到致命错误  -> 正在执行强制重启..."
+            kill_port_holder
+            kill -9 $PIPE_PID 2>/dev/null
+            break
         fi
 
     done
